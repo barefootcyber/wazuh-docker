@@ -1,0 +1,21 @@
+# gitleaks configuration.
+#
+# Seeded by barefootcyber/SOC_Development
+# Scripts/org-secret-guardrails/rollout_gitleaks.py (ARM-1337).
+#
+# Unlike the workflow beside it, this file is NOT managed centrally: the
+# rollout writes it once and never overwrites it, because the allowlist
+# belongs to the repository that owns the false positives.
+#
+# Every allowlist entry is somewhere a real secret could be committed
+# without the scan objecting, so each one needs a reason next to it.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Repository-specific false positives"
+paths = [
+    # This file lists the patterns it is allowed to skip.
+    '''^\.gitleaks\.toml$''',
+]
