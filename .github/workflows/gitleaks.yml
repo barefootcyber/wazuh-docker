@@ -1,0 +1,155 @@
+# gitleaks secret scan
+#
+# MANAGED FILE - barefootcyber/SOC_Development
+# managed-by: Scripts/org-secret-guardrails/rollout_gitleaks.py
+# template-version: 1
+#
+# Edits made here are overwritten by the next rollout. Change the template
+# in SOC_Development instead, raise template-version, and re-run the
+# rollout. See ARM-1337.
+#
+# Scans only the commits a pull request adds, never the full history.
+# Several repositories in this org have known historical leaks (ARM-1025),
+# and a full-history scan would fail every pull request on them from the
+# first run, which trains people to ignore the check.
+#
+# Uses the gitleaks CLI binary, not gitleaks/gitleaks-action. The Action
+# requires a paid GITLEAKS_LICENSE for organization-owned repositories;
+# the CLI does not.
+
+name: gitleaks
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_history:
+        description: "Scan the entire history instead of a commit range"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  scan:
+    name: Scan for committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@v4
+        with:
+          # The scan walks a commit range, so the shallow default clone is
+          # not enough: the base commit has to be present locally.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --proto "=https" --tlsv1.2 --retry 3 -o /tmp/gitleaks.tar.gz "$url"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Work out what to scan
+        id: range
+        env:
+          FULL_HISTORY: ${{ inputs.full_history }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${FULL_HISTORY:-false}" = "true" ]; then
+            echo "log_opts=--all" >> "$GITHUB_OUTPUT"
+            echo "scope=the entire history" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+            # Not a pull request and not an explicit full scan: fall back
+            # to the newest commit rather than silently scanning nothing.
+            echo "log_opts=--no-merges -1 HEAD" >> "$GITHUB_OUTPUT"
+            echo "scope=the most recent commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A force-push can leave the recorded base commit unreachable.
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "Base commit ${BASE_SHA} is not reachable, scanning the head commit only." >&2
+            echo "log_opts=--no-merges -1 ${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "scope=the head commit (base was unreachable)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "log_opts=--no-merges ${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "scope=${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan
+        id: scan
+        env:
+          LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+        run: |
+          set -uo pipefail
+          echo "Scanning ${{ steps.range.outputs.scope }}"
+
+          # --redact keeps the matched secret out of the public build log.
+          # A finding would otherwise be printed in full to anyone who can
+          # read Actions output.
+          set +e
+          gitleaks git \
+            --no-banner \
+            --redact \
+            --exit-code 2 \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --log-opts="${LOG_OPTS}" \
+            .
+          status=$?
+          set -e
+
+          if [ "$status" = "2" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$status" != "0" ]; then
+            echo "gitleaks exited $status (scan error, not a finding)." >&2
+            exit "$status"
+          fi
+          echo "found=false" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the report
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          retention-days: 30
+
+      - name: Fail if a secret was found
+        if: steps.scan.outputs.found == 'true'
+        run: |
+          {
+            echo "## gitleaks found secret-shaped content"
+            echo ""
+            echo "Scope scanned: \`${{ steps.range.outputs.scope }}\`"
+            echo ""
+            echo "The matched values are redacted in the log above. Download the"
+            echo "\`gitleaks-sarif\` artifact for the file, line and rule of each finding."
+            echo ""
+            echo "If it is a real credential: treat it as leaked. Rotate it first,"
+            echo "then remove it from the branch. Deleting the line is not enough,"
+            echo "because the value stays in the commit history."
+            echo ""
+            echo "If it is a false positive: add a narrow allowlist entry to"
+            echo "\`.gitleaks.toml\` in this repository, with a comment saying why."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
